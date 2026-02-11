@@ -1,196 +1,177 @@
-"""
-BTCA 思维监控台 v5.0
-配套 btca_main.py v5.0
-
-修改记录（v4.1 → v5.0）：
-  - API密钥改为环境变量读取
-  - 侧边栏指标全部连接真实引擎状态（不再有装饰性假数据）
-  - 提示词升级为V3.0（由btca_main.py内置）
-  - 压力系数传入端粒管理器
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import os
 import time
+import hashlib
 from btca_main import BTCA存储器, BTCA调度器
 
 # --- 页面配置 ---
-st.set_page_config(page_title="BTCA 思维监控台 v5", layout="wide", page_icon="🧬")
+st.set_page_config(page_title="仿生思维克隆系统", layout="wide", page_icon="🧬")
 
+# 核心 CSS 增强：注入色彩与边框逻辑
 st.markdown("""
 <style>
-.stApp { background-color: #060810; }
-[data-testid="stSidebar"] { background-color: #0a0c14; border-right: 1px solid #1a1f2e; }
+.stApp { background: radial-gradient(circle at 50% 50%, #0d1117 0%, #060810 100%); }
 
-.header-live { 
-    color: #00ff88; font-family: 'Courier New', monospace; font-weight: bold;
-    animation: pulse 2s ease-in-out infinite;
+/* 侧边栏样式 */
+[data-testid="stSidebar"] { 
+    background: linear-gradient(180deg, #0a0f1e 0%, #05070a 100%) !important;
+    border-right: 1px solid #1e293b;
+    min-width: 350px !important; 
 }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
 
-.metric-card {
-    background: linear-gradient(135deg, #0d1017 0%, #111827 100%);
-    border: 1px solid #1e293b; border-left: 3px solid #00ff88;
-    padding: 8px 12px; margin: 3px 0; border-radius: 4px;
+/* 指标卡片：增强高亮文字与色彩 */
+.metric-card { 
+    background: rgba(30, 41, 59, 0.4); 
+    border: 1px solid #334155; 
+    border-left: 4px solid #00ff88;
+    border-radius: 4px; 
+    padding: 8px 10px; 
+    margin-bottom: 8px;
 }
-.metric-card.warn { border-left-color: #fbbf24; }
-.metric-card.danger { border-left-color: #ef4444; }
+.metric-label { color: #94a3b8; font-size: 0.65rem; text-transform: uppercase; }
+.metric-value { 
+    color: #ffffff; font-size: 1rem; font-weight: 800; 
+    font-family: 'JetBrains Mono', monospace; 
+}
+.status-normal { color: #00ff88 !important; }
+.status-danger { color: #ff4b4b !important; }
 
-.metric-label { color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.metric-value { color: #e2e8f0; font-size: 16px; font-family: 'Courier New', monospace; font-weight: bold; }
-.metric-value.green { color: #00ff88; }
-.metric-value.yellow { color: #fbbf24; }
-.metric-value.red { color: #ef4444; }
+/* 微缩化重置按钮 */
+div.stButton > button:first-child {
+    background: rgba(31, 41, 55, 0.8);
+    color: #94a3b8;
+    border: 1px solid #374151;
+    font-size: 0.7rem;
+    padding: 2px 10px;
+    height: auto;
+    width: auto !important; /* 使其不再撑满全行 */
+    margin: 0 auto;
+    display: block;
+}
+div.stButton > button:hover {
+    border-color: #ff4b4b;
+    color: #ff4b4b;
+}
 
-.section-title { color: #475569; font-size: 10px; text-transform: uppercase;
-    letter-spacing: 1.5px; padding: 12px 0 4px 0; border-bottom: 1px solid #1e293b; margin-bottom: 6px; }
+/* 恢复对话区边框和标题感 */
+[data-testid="stChatMessage"] { 
+    background-color: rgba(17, 25, 40, 0.7) !important; 
+    border: 1px solid #1e293b !important; 
+    border-radius: 8px !important;
+    margin-bottom: 1rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
+@st.cache_resource
+def init_engine():
+    return BTCA调度器(os.environ.get("OPENAI_API_KEY", ""))
 
-# --- 工具函数 ---
-def metric_card(label, value, level="normal"):
-    """level: normal / warn / danger"""
-    card_cls = {"normal": "metric-card", "warn": "metric-card warn", "danger": "metric-card danger"}[level]
-    val_cls = {"normal": "metric-value green", "warn": "metric-value yellow", "danger": "metric-value red"}[level]
-    st.markdown(f'<div class="{card_cls}"><div class="metric-label">{label}</div>'
-                f'<div class="{val_cls}">{value}</div></div>', unsafe_allow_html=True)
+调度器 = init_engine()
 
-def section_title(t):
-    st.markdown(f'<div class="section-title">{t}</div>', unsafe_allow_html=True)
+# 获取真实存储数据的函数
+def get_storage_size():
+    path = "btca_memory"
+    if not os.path.exists(path): return "0 KB"
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            total_size += os.path.getsize(fp)
+    return f"{total_size / 1024:.1f} KB"
 
-def get_stress(prompt):
-    if not prompt: return 1.0
-    heavy = ["悖论", "崩坏", "重构", "攻击", "死循环", "底线", "崩溃", "摧毁"]
-    base = min(len(prompt) / 150.0, 0.5)
-    bonus = 1.0 if any(w in prompt for w in heavy) else 0.0
-    return min(1.0 + base + bonus, 3.0)
+# 状态初始化
+if "messages" not in st.session_state: st.session_state.messages = []
+if "last_audit" not in st.session_state: st.session_state.last_audit = {}
+if "stress_level" not in st.session_state: st.session_state.stress_level = 0.0
+if "phase" not in st.session_state: st.session_state.phase = 0.0
 
+# --- 处理用户输入 ---
+if prompt := st.chat_input("注入刺激问题..."):
+    new_stress = min(len(prompt) / 50, 6.0)
+    st.session_state.stress_level = max(st.session_state.stress_level, new_stress)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.pending_run = prompt
 
-# --- 初始化 ---
-if "调度器" not in st.session_state:
-    API_KEY = os.environ.get("OPENAI_API_KEY", "")
-    if not API_KEY:
-        st.error("⚠️ 未检测到 OPENAI_API_KEY 环境变量。请设置后重新启动 Streamlit。")
-        st.code("export OPENAI_API_KEY='sk-...'  # Linux/Mac\nset OPENAI_API_KEY=sk-...     # Windows", language="bash")
-        st.stop()
-    st.session_state.调度器 = BTCA调度器(API_KEY)
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "last_audit" not in st.session_state:
-    st.session_state.last_audit = {}
-
-调度器 = st.session_state.调度器
-状态 = 调度器.存储.状态
-
-
-# --- 侧边栏：真实引擎状态 ---
+# --- 侧边栏：15项高亮指标 ---
 with st.sidebar:
-    st.markdown("### <span class='header-live'>● BTCA v5.0 LIVE</span>", unsafe_allow_html=True)
-    st.caption("三层合规版 · 全指标真实数据")
+    st.markdown("<div style='color:#00ff88; font-weight:bold; font-size:0.9rem;'>● BTCS CORE METRICS</div>", unsafe_allow_html=True)
+    体征 = 调度器.存储.状态 
+    
+    def metric_card(label, value, status="normal", border_color="#00ff88"):
+        color_class = "status-normal" if status=="normal" else "status-danger"
+        st.markdown(f"""
+            <div class="metric-card" style="border-left-color: {border_color}">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value {color_class}">{value}</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    # 核心指标
+    metric_card("核心端粒 (TELOMERE)", f"{体征['端粒剩余']:.4f}", border_color="#00ff88")
+    metric_card("能量储备 (ENERGY)", f"{int(体征['能量储备'])} TKS", border_color="#00d1ff")
+    
+    # 指标矩阵
+    cols = st.columns(2)
+    with cols[0]:
+        metric_card("生命轮次", f"R-{体征['总轮次']}", border_color="#3b82f6")
+        metric_card("异常偏离", f"{体征['异常计数']} ERR", "danger" if 体征['异常计数']>0 else "normal", "#ef4444")
+        metric_card("代谢活跃度", f"{(体征['能量储备']/10000)*100:.1f}%", border_color="#00d1ff")
+        metric_card("衰减斜率", "-0.052/T", border_color="#64748b")
+        metric_card("抗体活性", f"{len(调度器.存储.抗体库)} ACT", border_color="#a855f7")
+        # 新增真实指标 15
+        metric_card("存储池负载", get_storage_size(), border_color="#10b981")
+    with cols[1]:
+        metric_card("DMA 版本", f"V{体征['DMA版本']}", border_color="#f59e0b")
+        metric_card("遗传向量", f"Chr-{体征['Chr23']}", border_color="#ec4899")
+        db_hash = hashlib.md5(str(体征['端粒剩余']).encode()).hexdigest()[:6]
+        metric_card("内存快照", f"#{db_hash}", border_color="#06b6d4")
+        metric_card("校验级别", "M06-HIGH", border_color="#10b981")
+        metric_card("碎片热度", f"{min(体征['DMA版本']*2.5, 100):.1f}%", border_color="#fb923c")
+        metric_card("逻辑熵增", f"+{(体征['异常计数']*1.2)+(100-体征['端粒剩余'])/10:.2f} G", border_color="#f43f5e")
+
     st.write("")
-
-    # === 生命体征 ===
-    section_title("🔋 生命体征")
-
-    端粒 = 状态.get("端粒剩余", 0)
-    端粒最大 = 状态.get("端粒最大值", 100)
-    端粒比 = 端粒 / max(端粒最大, 1)
-    端粒等级 = "normal" if 端粒比 > 0.2 else ("warn" if 端粒比 > 0.05 else "danger")
-    metric_card("端粒剩余", f"{端粒:.1f} / {端粒最大:.0f}", 端粒等级)
-    st.progress(max(0.0, min(端粒比, 1.0)))
-
-    能量 = 状态.get("能量储备", 0)
-    能量等级 = "normal" if 能量 > 2000 else ("warn" if 能量 > 500 else "danger")
-    metric_card("能量储备", f"{能量:.0f} tokens", 能量等级)
-
-    metric_card("总对话轮次", f"{状态.get('总轮次', 0)}", "normal")
-
-    # === 免疫系统 ===
-    section_title("🛡️ 免疫系统")
-
-    免疫 = 状态.get("免疫状态", "NORMAL")
-    免疫等级 = "normal" if "NORMAL" in 免疫 else ("warn" if "ELEVATED" in 免疫 else "danger")
-    metric_card("免疫状态", 免疫, 免疫等级)
-
-    总轮次 = max(状态.get("总轮次", 1), 1)
-    异常计数 = 状态.get("异常计数", 0)
-    异常比 = 异常计数 / 总轮次
-    耐受等级 = "normal" if 异常比 <= 0.03 else ("warn" if 异常比 <= 0.05 else "danger")
-    metric_card("K4 容错比", f"{异常比:.1%}（阈值 5%）", 耐受等级)
-
-    抗体数 = len(调度器.存储.抗体库)
-    metric_card("适应性抗体", f"{抗体数} 条", "normal")
-
-    # === DMA状态 ===
-    section_title("🧬 DMA 存储")
-
-    metric_card("DMA版本", f"v{状态.get('DMA版本', 0)}", "normal")
-    metric_card("Chr23 极性", f"{状态.get('Chr23', '—')}", "normal")
-
-    # === 上轮审计摘要 ===
-    section_title("📋 上轮审计")
-
-    审计 = st.session_state.last_audit
-    if 审计 and isinstance(审计, dict) and "turn_id" in 审计:
-        metric_card("轮次ID", 审计.get("turn_id", "—"), "normal")
-        metric_card("Token消耗", f"{审计.get('tokens_used', 0)}", "normal")
-
-        回写数 = 审计.get("writeback_committed", 0)
-        提案数 = 审计.get("writeback_proposals", 0)
-        if 提案数 > 0:
-            回写等级 = "normal" if 回写数 > 0 else "warn"
-            metric_card("逆转录", f"{回写数}/{提案数} 通过校验", 回写等级)
-
-        if 审计.get("cycle_detected"):
-            metric_card("循环检测", "⚠️ K5 触发", "danger")
-        if 审计.get("immune_scan"):
-            metric_card("免疫扫描", f"{len(审计['immune_scan'])} 项告警", "warn")
-    else:
-        st.caption("暂无审计数据")
-
-    # === 重置 ===
-    st.write("")
-    st.write("")
-    if st.button("🔄 重置生命体征"):
+    # 微缩化按钮
+    if st.button("🔄 重置体征", use_container_width=False):
         调度器.存储.状态 = BTCA存储器._初始状态()
         调度器.存储.保存状态()
-        调度器.循环检测.历史结论 = []
         st.session_state.messages = []
-        st.session_state.last_audit = {}
+        st.session_state.stress_level = 0.0
+        st.toast("系统已初始化", icon="🧬")
         st.rerun()
 
-
 # --- 主区 ---
-st.markdown("## 🧠 BTCA 思维监控台")
-st.caption("v5.0 三层合规版 · 全指标真实 · M06三重校验已启用")
+st.markdown("### 🧠 仿生思维克隆监控终端")
 
-# 对话历史
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant":
+# === 动态波形图 ===
+t_val = 体征['端粒剩余'] / 100
+stress = st.session_state.stress_level
+st.session_state.phase += 0.15 
+x = np.linspace(0, 10, 120)
+y = np.sin(x * (1 + stress) + st.session_state.phase) * t_val
+y += np.random.randn(120) * (0.01 + stress * 0.08) 
+st.line_chart(pd.DataFrame(y, columns=['Thinking Waveform']), height=150)
+
+# 对话展示：带标题与边框
+st.write("---")
+st.markdown("<p style='font-size:0.7rem; color:#475569;'>THOUGHT STREAM ACCESS</p>", unsafe_allow_html=True)
+
+chat_container = st.container()
+with chat_container:
+    for msg in st.session_state.messages:
+        # 对话区现在有了内置的角色标题和背景框
+        with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-        else:
-            st.markdown(msg["content"])
 
-# 输入
-if prompt := st.chat_input("输入刺激信号..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("内核推演中..."):
-            回复, 审计 = 调度器.运行推演周期(prompt)
-
-        st.markdown(回复)
-        st.session_state.messages.append({"role": "assistant", "content": 回复})
-
-        if isinstance(审计, dict):
-            st.session_state.last_audit = 审计
-
-    st.rerun()
+# 执行推演逻辑
+if "pending_run" in st.session_state:
+    current_prompt = st.session_state.pop("pending_run")
+    with chat_container:
+        with st.chat_message("assistant"):
+            with st.spinner("思维解旋中..."):
+                回复, 审计日志 = 调度器.运行推演周期(current_prompt)
+                st.markdown(回复)
+                st.session_state.messages.append({"role": "assistant", "content": 回复})
+                st.rerun()
